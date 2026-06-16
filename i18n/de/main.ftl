@@ -74,6 +74,18 @@ book-additional-guests-label = Weitere Teilnehmer
 book-additional-guests-hint = (optional, bis zu { $max })
 book-add-guest-btn = + Teilnehmer hinzufügen
 book-guest-email-placeholder = kollege@example.com
+captcha-label = Sicherheitsüberprüfung
+captcha-initial-state = Bestätigen Sie, dass Sie ein Mensch sind
+captcha-verifying = Überprüfung läuft...
+captcha-solved = Sie sind ein Mensch
+captcha-error = Fehler
+captcha-troubleshooting = Fehlerbehebung
+captcha-wasm-disabled = WASM aktivieren für deutlich schnellere Lösung
+captcha-verify-aria = Klicken Sie, um zu bestätigen, dass Sie ein Mensch sind
+captcha-verifying-aria = Überprüfung läuft, bitte warten
+captcha-verified-aria = Bestätigt
+captcha-required = Bitte bestätigen Sie, dass Sie ein Mensch sind
+captcha-error-aria = Ein Fehler ist aufgetreten, bitte versuchen Sie es erneut
 book-confirm-button = Buchung bestätigen
 
 # Shared labels used across the cancel / decline / approve / reschedule / claim flows

@@ -342,6 +342,36 @@ document.querySelectorAll('input[type="color"]').forEach(function(picker) {
   </form>
 </div>
 
+<!-- Captcha settings -->
+<div class="card">
+  <h2>Captcha</h2>
+  <div style="margin-bottom: 1rem; font-size: 0.875rem; color: var(--text-secondary);">
+    Status: {% if captcha_configured %}<strong style="color: var(--success);">enabled</strong>{% else %}<span style="color: var(--text-muted);">disabled</span>{% endif %}
+    {% if captcha_instance_url %}&middot; Instance: <span style="color: var(--text-muted);">{{ captcha_instance_url }}</span>{% endif %}
+  </div>
+  <form method="post" action="/dashboard/admin/captcha">
+    <div class="form-group">
+      <label>Instance URL</label>
+      <input type="url" name="captcha_instance_url" value="{{ captcha_instance_url }}" placeholder="https://captcha.example.com">
+    </div>
+    <div class="form-group">
+      <label>Site key</label>
+      <input type="text" name="captcha_site_key" value="{{ captcha_site_key }}" placeholder="your-site-key">
+    </div>
+    <div class="form-group">
+      <label>Secret <span class="hint">(leave empty to keep current)</span></label>
+      <input type="password" name="captcha_secret" value="" placeholder="Leave empty to keep unchanged">
+    </div>
+    <div class="form-group">
+      <label>Widget script URL <span class="hint">(optional)</span></label>
+      <input type="url" name="captcha_widget_url" value="{{ captcha_widget_url }}" placeholder="https://cdn.jsdelivr.net/npm/cap-widget">
+      <span style="font-size: 0.8rem; color: var(--text-muted);">Override if the CDN is blocked. Changes take effect immediately after saving.</span>
+    </div>
+    <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.75rem;">Leave instance URL, site key and secret empty to disable captcha on booking pages.</p>
+    <button type="submit" class="slot-btn" style="cursor: pointer; font-weight: 600; color: var(--accent); border-color: var(--accent);">Save captcha settings</button>
+  </form>
+</div>
+
 <!-- SMTP settings -->
 <div class="card">
   <h2>SMTP settings</h2>

@@ -119,6 +119,27 @@
     </script>
     {% endif %}
 
+    {% if captcha_enabled %}
+    <div class="form-group">
+      <label>{{ t("captcha-label") }}</label>
+      <script src="{{ captcha_widget_url }}"></script>
+      <cap-widget
+        data-cap-api-endpoint="{{ captcha_api_endpoint }}"
+        data-cap-i18n-initial-state="{{ t('captcha-initial-state') }}"
+        data-cap-i18n-verifying-label="{{ t('captcha-verifying') }}"
+        data-cap-i18n-solved-label="{{ t('captcha-solved') }}"
+        data-cap-i18n-error-label="{{ t('captcha-error') }}"
+        data-cap-i18n-troubleshooting-label="{{ t('captcha-troubleshooting') }}"
+        data-cap-i18n-wasm-disabled="{{ t('captcha-wasm-disabled') }}"
+        data-cap-i18n-verify-aria-label="{{ t('captcha-verify-aria') }}"
+        data-cap-i18n-verifying-aria-label="{{ t('captcha-verifying-aria') }}"
+        data-cap-i18n-verified-aria-label="{{ t('captcha-verified-aria') }}"
+        data-cap-i18n-required-label="{{ t('captcha-required') }}"
+        data-cap-i18n-error-aria-label="{{ t('captcha-error-aria') }}"
+      ></cap-widget>
+    </div>
+    {% endif %}
+
     <button type="submit" class="btn">{{ t("book-confirm-button") }}</button>
   </form>
 </div>

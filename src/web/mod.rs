@@ -1,3 +1,5 @@
+pub mod captcha;
+
 use crate::utils::convert_event_to_tz;
 use axum::extract::{Form, Multipart, Path, Query, State};
 use axum::http::HeaderMap;
@@ -89,6 +91,13 @@ pub struct AppState {
     pub secret_key: [u8; 32],
     pub theme_css: tokio::sync::RwLock<String>,
     pub company_link: tokio::sync::RwLock<Option<String>>,
+    pub captcha_config: tokio::sync::RwLock<Option<captcha::CaptchaConfig>>,
+    /// CSP for booking form pages: relaxed with captcha origins when captcha
+    /// is enabled, identical to `csp_baseline` otherwise. Rebuilt on admin save.
+    pub csp: tokio::sync::RwLock<String>,
+    /// Strict baseline CSP served on every non-booking page regardless of
+    /// captcha configuration.
+    pub csp_baseline: String,
 }
 
 // --- CSRF protection (double-submit cookie pattern) ---
@@ -831,6 +840,62 @@ async fn csrf_cookie_middleware(
     response
 }
 
+fn build_csp(captcha: &Option<captcha::CaptchaConfig>) -> String {
+    let (wasm_eval, worker_src, script_extra, connect_extra) = match captcha.as_ref() {
+        Some(c) => {
+            let widget_origin = c.widget_script_origin();
+            let instance_origin = c.instance_origin();
+            (
+                " 'wasm-unsafe-eval'",
+                "worker-src blob:; ",
+                format!(" {}", widget_origin),
+                format!(" {} {}", instance_origin, widget_origin),
+            )
+        }
+        None => ("", "", String::new(), String::new()),
+    };
+    format!(
+        "default-src 'self'; img-src 'self' data:; \
+         style-src 'self' 'unsafe-inline'; \
+         script-src 'self' 'unsafe-inline'{}{}; \
+         {}connect-src 'self'{}; \
+         object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
+        wasm_eval, script_extra, worker_src, connect_extra
+    )
+}
+
+/// Booking form pages (`…/book`) are the only pages that embed the captcha
+/// widget, so they are the only ones that get the relaxed CSP when captcha is
+/// enabled. Every other page keeps the strict baseline policy.
+fn is_booking_form_path(path: &str) -> bool {
+    path.ends_with("/book")
+}
+
+async fn csp_middleware(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let booking_page = is_booking_form_path(request.uri().path());
+    let mut response = next.run(request).await;
+    if !response
+        .headers()
+        .contains_key(axum::http::header::CONTENT_SECURITY_POLICY)
+    {
+        let csp = if booking_page {
+            state.csp.read().await.clone()
+        } else {
+            state.csp_baseline.clone()
+        };
+        if let Ok(val) = axum::http::HeaderValue::from_str(&csp) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::CONTENT_SECURITY_POLICY, val);
+        }
+    }
+    response
+}
+
 pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8; 32]) -> Router {
     let mut env = Environment::new();
     env.set_undefined_behavior(minijinja::UndefinedBehavior::Lenient);
@@ -839,6 +904,8 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
 
     let initial_theme_css = build_theme_css(&pool).await;
     let initial_company_link = get_company_link(&pool).await;
+    let initial_captcha = captcha::load_captcha_config(&pool, &secret_key).await;
+    let initial_csp = build_csp(&initial_captcha);
 
     let state = Arc::new(AppState {
         pool,
@@ -850,6 +917,9 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
         data_dir,
         theme_css: tokio::sync::RwLock::new(initial_theme_css),
         company_link: tokio::sync::RwLock::new(initial_company_link),
+        captcha_config: tokio::sync::RwLock::new(initial_captcha),
+        csp: tokio::sync::RwLock::new(initial_csp),
+        csp_baseline: build_csp(&None),
     });
 
     Router::new()
@@ -991,6 +1061,7 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
             "/dashboard/admin/google-oauth2",
             post(admin_update_google_oauth2),
         )
+        .route("/dashboard/admin/captcha", post(admin_update_captcha))
         .route("/dashboard/admin/logo", post(admin_upload_logo))
         .route("/dashboard/admin/logo/delete", post(admin_delete_logo))
         .route(
@@ -1100,6 +1171,10 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
         // theme toggle, time-zone banner) and inline `style="..."` attributes.
         // Tightening this would require nonces wired through every render
         // site or a sweep across templates to externalize inline blocks.
+        //
+        // The CSP itself is set by `csp_middleware`: booking form pages
+        // (`…/book`) get the captcha-relaxed policy when captcha is enabled,
+        // everything else always gets the strict baseline.
         .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::header::X_FRAME_OPTIONS,
             axum::http::HeaderValue::from_static("SAMEORIGIN"),
@@ -1118,14 +1193,9 @@ pub async fn create_router(pool: SqlitePool, data_dir: PathBuf, secret_key: [u8;
                 "geolocation=(), microphone=(), camera=(), payment=(), usb=()",
             ),
         ))
-        .layer(SetResponseHeaderLayer::if_not_present(
-            axum::http::header::CONTENT_SECURITY_POLICY,
-            axum::http::HeaderValue::from_static(
-                "default-src 'self'; img-src 'self' data:; \
-                 style-src 'self' 'unsafe-inline'; \
-                 script-src 'self' 'unsafe-inline'; \
-                 object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
-            ),
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            csp_middleware,
         ))
         .with_state(state)
 }
@@ -8314,6 +8384,7 @@ async fn show_group_book_form(
         Ok(t) => t,
         Err(e) => return internal_error_html("internal", &e),
     };
+    let captcha = captcha::CaptchaVars::from_config(&*state.captcha_config.read().await);
     let rendered = tmpl
         .render(context! {
             event_type => context! {
@@ -8338,6 +8409,9 @@ async fn show_group_book_form(
             invite_token => query.invite.as_deref().unwrap_or(""),
             max_additional_guests => max_additional_guests,
             company_link => state.company_link.read().await.clone(),
+            captcha_enabled => captcha.enabled,
+            captcha_api_endpoint => captcha.api_endpoint,
+            captcha_widget_url => captcha.widget_url,
             lang => lang,
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e));
@@ -8356,6 +8430,20 @@ async fn handle_group_booking(
         return resp;
     }
     let lang = crate::i18n::detect_from_headers(&headers);
+    let captcha_cfg = state.captcha_config.read().await;
+    if captcha::verify(&captcha_cfg, form.captcha_token.as_deref())
+        .await
+        .is_err()
+    {
+        tracing::warn!("captcha failed on group booking");
+        return render_booking_action_error(
+            &state,
+            &headers,
+            "Captcha verification failed",
+            "Please go back and try again.",
+        );
+    }
+    drop(captcha_cfg);
     // Rate limit by IP
     let client_ip = client_ip_for_rate_limit(&headers);
     if state.booking_limiter.check_limited(&client_ip).await {
@@ -9116,6 +9204,7 @@ async fn show_dynamic_group_book_form(
         Ok(t) => t,
         Err(e) => return internal_error_html("internal", &e),
     };
+    let captcha = captcha::CaptchaVars::from_config(&*state.captcha_config.read().await);
     Html(
         tmpl.render(context! {
             event_type => context! {
@@ -9140,6 +9229,9 @@ async fn show_dynamic_group_book_form(
             invite_token => "",
             max_additional_guests => max_additional_guests,
             company_link => state.company_link.read().await.clone(),
+            captcha_enabled => captcha.enabled,
+            captcha_api_endpoint => captcha.api_endpoint,
+            captcha_widget_url => captcha.widget_url,
             lang => lang,
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e)),
@@ -9828,6 +9920,7 @@ async fn show_book_form_for_user(
         Ok(t) => t,
         Err(e) => return internal_error_html("internal", &e),
     };
+    let captcha = captcha::CaptchaVars::from_config(&*state.captcha_config.read().await);
     let rendered = tmpl
         .render(context! {
             event_type => context! {
@@ -9852,6 +9945,9 @@ async fn show_book_form_for_user(
             invite_token => query.invite.as_deref().unwrap_or(""),
             max_additional_guests => max_additional_guests,
             company_link => state.company_link.read().await.clone(),
+            captcha_enabled => captcha.enabled,
+            captcha_api_endpoint => captcha.api_endpoint,
+            captcha_widget_url => captcha.widget_url,
             lang => lang,
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e));
@@ -9868,6 +9964,20 @@ async fn handle_booking_for_user(
     if let Err(resp) = verify_csrf_token(&headers, &form._csrf) {
         return resp;
     }
+    let captcha_cfg = state.captcha_config.read().await;
+    if captcha::verify(&captcha_cfg, form.captcha_token.as_deref())
+        .await
+        .is_err()
+    {
+        tracing::warn!("captcha failed on user booking");
+        return render_booking_action_error(
+            &state,
+            &headers,
+            "Captcha verification failed",
+            "Please go back and try again.",
+        );
+    }
+    drop(captcha_cfg);
     if username.contains('+') {
         return handle_dynamic_group_booking(&state, &headers, &username, &slug, &form).await;
     }
@@ -11764,6 +11874,7 @@ async fn show_book_form(
         Ok(t) => t,
         Err(e) => return internal_error_html("internal", &e),
     };
+    let captcha = captcha::CaptchaVars::from_config(&*state.captcha_config.read().await);
     let rendered = tmpl
         .render(context! {
             event_type => context! {
@@ -11784,6 +11895,9 @@ async fn show_book_form(
             form_notes => "",
             max_additional_guests => max_additional_guests,
             company_link => state.company_link.read().await.clone(),
+            captcha_enabled => captcha.enabled,
+            captcha_api_endpoint => captcha.api_endpoint,
+            captcha_widget_url => captcha.widget_url,
             lang => lang,
         })
         .unwrap_or_else(|e| internal_error_body("template render", &e));
@@ -11882,6 +11996,8 @@ struct BookForm {
     invite_token: Option<String>,
     #[serde(default)]
     additional_guests: Option<String>,
+    #[serde(rename = "cap-token", default)]
+    captcha_token: Option<String>,
 }
 
 async fn handle_booking(
@@ -11894,6 +12010,20 @@ async fn handle_booking(
         return resp;
     }
     let lang = crate::i18n::detect_from_headers(&headers);
+    let captcha_cfg = state.captcha_config.read().await;
+    if captcha::verify(&captcha_cfg, form.captcha_token.as_deref())
+        .await
+        .is_err()
+    {
+        tracing::warn!("captcha failed on booking");
+        return render_booking_action_error(
+            &state,
+            &headers,
+            "Captcha verification failed",
+            "Please go back and try again.",
+        );
+    }
+    drop(captcha_cfg);
     // Rate limit by IP
     let client_ip = client_ip_for_rate_limit(&headers);
     if state.booking_limiter.check_limited(&client_ip).await {
@@ -13007,6 +13137,22 @@ async fn admin_dashboard(
         version => env!("CARGO_PKG_VERSION"),
     };
 
+    let captcha_cfg = state.captcha_config.read().await;
+    let captcha_configured = captcha_cfg.is_some();
+    let captcha_instance_url = captcha_cfg
+        .as_ref()
+        .map(|c| c.instance_url.clone())
+        .unwrap_or_default();
+    let captcha_site_key = captcha_cfg
+        .as_ref()
+        .map(|c| c.site_key.clone())
+        .unwrap_or_default();
+    let captcha_widget_url = captcha_cfg
+        .as_ref()
+        .map(|c| c.widget_url.clone())
+        .unwrap_or_else(|| captcha::DEFAULT_WIDGET_URL.to_string());
+    drop(captcha_cfg);
+
     Html(
         tmpl.render(context! {
             current_user_id => current_user.id,
@@ -13030,6 +13176,10 @@ async fn admin_dashboard(
             smtp_enabled => smtp_enabled,
             smtp_from_env => smtp_from_env,
             smtp_error => smtp_error,
+            captcha_configured => captcha_configured,
+            captcha_instance_url => captcha_instance_url,
+            captcha_site_key => captcha_site_key,
+            captcha_widget_url => captcha_widget_url,
             has_logo => state.data_dir.join("logo.png").exists(),
             company_link => get_company_link(&state.pool).await.unwrap_or_default(),
             current_theme => get_theme_name(&state.pool).await,
@@ -13613,6 +13763,79 @@ async fn google_callback(
         Redirect::to("/dashboard/sources")
     };
     (headers, redirect).into_response()
+}
+
+// --- Captcha settings ---
+
+#[derive(Deserialize)]
+struct AdminCaptchaForm {
+    _csrf: Option<String>,
+    captcha_instance_url: Option<String>,
+    captcha_site_key: Option<String>,
+    captcha_secret: Option<String>,
+    captcha_widget_url: Option<String>,
+}
+
+async fn admin_update_captcha(
+    State(state): State<Arc<AppState>>,
+    _admin: crate::auth::AdminUser,
+    headers: HeaderMap,
+    Form(form): Form<AdminCaptchaForm>,
+) -> impl IntoResponse {
+    if let Err(resp) = verify_csrf_token(&headers, &form._csrf) {
+        return resp;
+    }
+
+    let instance_url = form.captcha_instance_url.filter(|s| !s.trim().is_empty());
+    let site_key = form.captcha_site_key.filter(|s| !s.trim().is_empty());
+    let widget_url = form.captcha_widget_url.filter(|s| !s.trim().is_empty());
+
+    let secret_provided = form
+        .captcha_secret
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+
+    if secret_provided {
+        let secret = form.captcha_secret.unwrap_or_default();
+        let encrypted = match crate::crypto::encrypt_value(&state.secret_key, &secret) {
+            Ok(s) => s,
+            Err(e) => return internal_error_response("encrypt captcha secret", &e),
+        };
+        if let Err(e) = sqlx::query(
+            "UPDATE auth_config SET captcha_instance_url = ?, captcha_site_key = ?, captcha_secret = ?, captcha_widget_url = ?, updated_at = datetime('now') WHERE id = 'singleton'",
+        )
+        .bind(&instance_url)
+        .bind(&site_key)
+        .bind(&encrypted)
+        .bind(&widget_url)
+        .execute(&state.pool)
+        .await
+        {
+            tracing::error!(error = %e, "failed to save captcha config");
+        }
+    } else {
+        if let Err(e) = sqlx::query(
+            "UPDATE auth_config SET captcha_instance_url = ?, captcha_site_key = ?, captcha_widget_url = ?, updated_at = datetime('now') WHERE id = 'singleton'",
+        )
+        .bind(&instance_url)
+        .bind(&site_key)
+        .bind(&widget_url)
+        .execute(&state.pool)
+        .await
+        {
+            tracing::error!(error = %e, "failed to save captcha config");
+        }
+    }
+
+    let new_config = captcha::load_captcha_config(&state.pool, &state.secret_key).await;
+    let new_csp = build_csp(&new_config);
+    *state.captcha_config.write().await = new_config;
+    *state.csp.write().await = new_csp;
+
+    tracing::info!(admin = %_admin.0.email, "admin: captcha config updated");
+
+    Redirect::to("/dashboard/admin").into_response()
 }
 
 // --- Logo management ---
@@ -23977,5 +24200,76 @@ mod tests {
             "Mary Smith"
         );
         assert_eq!(derive_name_from_email("alice@example.com"), "Alice");
+    }
+
+    // --- build_csp tests ---
+
+    fn make_captcha_config(instance_url: &str, widget_url: &str) -> captcha::CaptchaConfig {
+        captcha::CaptchaConfig {
+            instance_url: instance_url.to_string(),
+            site_key: "testkey".to_string(),
+            secret: "secret".to_string(),
+            widget_url: widget_url.to_string(),
+        }
+    }
+
+    #[test]
+    fn build_csp_without_captcha_has_no_extra_directives() {
+        let csp = build_csp(&None);
+        assert!(!csp.contains("wasm-unsafe-eval"));
+        assert!(!csp.contains("worker-src"));
+        assert!(!csp.contains("cdn.jsdelivr.net"));
+        assert!(csp.contains("script-src 'self' 'unsafe-inline'"));
+        assert!(csp.contains("connect-src 'self'"));
+    }
+
+    #[test]
+    fn build_csp_with_captcha_includes_wasm_and_worker_src() {
+        let cfg = Some(make_captcha_config(
+            "https://cap.example.com",
+            captcha::DEFAULT_WIDGET_URL,
+        ));
+        let csp = build_csp(&cfg);
+        assert!(csp.contains("'wasm-unsafe-eval'"));
+        assert!(csp.contains("worker-src blob:"));
+    }
+
+    #[test]
+    fn build_csp_with_captcha_includes_script_origin() {
+        let cfg = Some(make_captcha_config(
+            "https://cap.example.com",
+            captcha::DEFAULT_WIDGET_URL,
+        ));
+        let csp = build_csp(&cfg);
+        assert!(csp.contains("https://cdn.jsdelivr.net"), "{}", csp);
+    }
+
+    #[test]
+    fn booking_form_paths_get_relaxed_csp() {
+        assert!(is_booking_form_path("/u/alice/intro/book"));
+        assert!(is_booking_form_path("/team/sales/demo/book"));
+        assert!(is_booking_form_path("/intro/book"));
+    }
+
+    #[test]
+    fn non_booking_paths_keep_baseline_csp() {
+        assert!(!is_booking_form_path("/"));
+        assert!(!is_booking_form_path("/dashboard"));
+        assert!(!is_booking_form_path("/dashboard/admin"));
+        assert!(!is_booking_form_path("/u/alice/intro"));
+        assert!(!is_booking_form_path("/booking/cancel/sometoken"));
+        assert!(!is_booking_form_path("/u/alice/bookkeeping"));
+    }
+
+    #[test]
+    fn build_csp_with_captcha_includes_connect_origins() {
+        let cfg = Some(make_captcha_config(
+            "https://cap.example.com",
+            captcha::DEFAULT_WIDGET_URL,
+        ));
+        let csp = build_csp(&cfg);
+        assert!(csp.contains("connect-src 'self'"), "{}", csp);
+        assert!(csp.contains("https://cap.example.com"), "{}", csp);
+        assert!(csp.contains("https://cdn.jsdelivr.net"), "{}", csp);
     }
 }

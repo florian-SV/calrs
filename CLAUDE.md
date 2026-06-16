@@ -317,6 +317,104 @@ File: `src/web/mod.rs`, templates in `templates/`
 
 ---
 
+## Captcha (trycap / Cap)
+
+### What it does
+
+Protects booking endpoints against bots with a privacy-first proof-of-work CAPTCHA. The feature is **opt-in**: when no configuration is stored the booking flow works exactly as before — no widget, no server-side check. The captcha is only active on booking form pages (guest-facing), never on registration or dashboard routes.
+
+The chosen provider is [Cap](https://trycap.dev) — self-hosted, no GAFAM, no tracking, Docker-deployable. It is API-compatible with the reCAPTCHA/hCaptcha verification protocol, so switching providers in the future only requires updating `src/web/captcha.rs`.
+
+### Configuration (admin panel)
+
+Configured at `/dashboard/admin` → **Captcha** section. Four fields:
+
+| Field | Required | Description |
+|---|---|---|
+| Instance URL | Yes | Base URL of your Cap server, e.g. `https://captcha.example.com` |
+| Site key | Yes | Site key from the Cap dashboard |
+| Secret | Yes | Secret key for server-to-server verification (encrypted at rest with AES-256-GCM, same pattern as OIDC client secret) |
+| Widget script URL | No | Override the JS bundle URL. Defaults to `https://cdn.jsdelivr.net/npm/cap-widget`. Useful for air-gapped deployments. Changes take effect immediately after saving (CSP is rebuilt in memory). |
+
+Leaving all three main fields empty disables the captcha. The secret uses the keep-current pattern: leaving the password field empty on save preserves the stored value.
+
+### How it works end-to-end
+
+**GET (booking form):** The handler reads `state.captcha_config` (a `RwLock<Option<CaptchaConfig>>`). If `Some`, it passes `captcha_enabled = true`, `captcha_api_endpoint`, and `captcha_widget_url` to the template. The `<cap-widget>` element is rendered conditionally in `templates/book.html` with all i18n attributes pre-filled via the Fluent `t()` helper.
+
+**POST (booking submit):** The `BookForm` struct has a `captcha_token: Option<String>` field with `#[serde(rename = "cap-token")]` — the field name the Cap widget submits. After the CSRF check, `captcha::verify(&captcha_cfg, form.captcha_token.as_deref()).await` is called:
+- `config = None` → `Ok(())` immediately (pass-through)
+- `config = Some`, token missing/empty → `Err(())` → renders `booking_action_error.html`
+- `config = Some`, token present → POST to `<instance>/<site-key>/siteverify` with JSON `{"secret": "...", "response": "<token>"}` → parses `{"success": bool}`
+
+The verification is implemented in `src/web/captcha.rs` and applies to **3 handlers**: `handle_booking`, `handle_booking_for_user`, `handle_group_booking`. The dynamic group booking path (`username.contains('+')`) is also protected because the check happens before the branch.
+
+### Code structure
+
+| File | Role |
+|---|---|
+| `src/web/captcha.rs` | Self-contained module: `CaptchaConfig` struct, `load_captcha_config()`, `verify()`, `extract_origin()` helper, unit tests |
+| `src/web/mod.rs` | `AppState.captcha_config: RwLock<Option<CaptchaConfig>>`, `build_csp()`, `csp_middleware()`, `admin_update_captcha()` handler, wiring in the 4 GET form handlers and 3 POST booking handlers |
+| `migrations/053_captcha.sql` | Adds `captcha_instance_url`, `captcha_site_key`, `captcha_secret`, `captcha_widget_url` columns to `auth_config` |
+| `templates/admin.html` | Captcha configuration section (status badge, 4 inputs, save button) |
+| `templates/book.html` | Conditional `<cap-widget>` with all `data-cap-i18n-*` attributes |
+| `templates/base.html` | CSS custom property overrides for `cap-widget` theming |
+
+### Content-Security-Policy
+
+The CSP is **dynamic** — it is rebuilt whenever the admin saves captcha settings, without a server restart (except for the widget script URL, which controls the `script-src` domain). It is stored as a pre-built string in `AppState.csp: RwLock<String>` and applied by `csp_middleware` (an Axum `from_fn_with_state` layer).
+
+`build_csp(captcha: &Option<CaptchaConfig>) -> String` produces:
+
+**Without captcha configured:**
+```
+default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline';
+script-src 'self' 'unsafe-inline';
+connect-src 'self';
+object-src 'none'; base-uri 'self'; frame-ancestors 'self'
+```
+
+**With captcha configured:**
+```
+default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline';
+script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' <widget-origin>;
+worker-src blob:;
+connect-src 'self' <instance-origin> <widget-origin>;
+object-src 'none'; base-uri 'self'; frame-ancestors 'self'
+```
+
+The three extra directives and why they are needed:
+- **`'wasm-unsafe-eval'` in `script-src`** — Cap's proof-of-work solver runs as a WASM module. Without this, browsers block `WebAssembly.instantiate()` under a strict CSP. Falls back to a JS solver if blocked, but WASM is much faster.
+- **`worker-src blob:`** — The Cap widget spawns a Web Worker via a `blob:` URL to run the solver off the main thread. `worker-src` is not inherited from `script-src` in all browsers, so it must be explicit.
+- **`<widget-origin>` in `connect-src`** — The widget's JS fetches the WASM binary from the same CDN origin via `fetch()`. This is controlled by `connect-src`, not `script-src`. Both the Cap server origin (for token verification XHR) and the widget CDN origin (for WASM fetch) must be in `connect-src`.
+
+The `csp_middleware` skips setting the header if it is already present, so individual handlers can override it if needed in the future.
+
+### Translations
+
+All visible strings in the Cap widget are localised via the standard Fluent system. Keys use the `captcha-` prefix and live in each language file:
+
+Keys: `captcha-label`, `captcha-initial-state`, `captcha-verifying`, `captcha-solved`, `captcha-error`, `captcha-troubleshooting`, `captcha-wasm-disabled`, plus five `*-aria` keys for accessibility.
+
+### Styling
+
+The `<cap-widget>` custom element exposes CSS custom properties. They are overridden globally in `templates/base.html` to follow the app's existing theme variables:
+
+```css
+cap-widget {
+  --cap-background: var(--surface);
+  --cap-border-color: var(--border);
+  --cap-color: var(--text);
+  --cap-checkbox-background: var(--surface-hover);
+  --cap-spinner-color: var(--text);
+  --cap-spinner-background-color: var(--border);
+}
+```
+
+Because `--surface`, `--border`, etc. are already overridden by `html.dark { ... }` (in `base.html`) and by each preset/custom theme (via `theme_css` in `AppState`), the widget automatically adapts to dark mode and all custom themes (Nord, Dracula, Tokyo Night, etc.) with no additional CSS.
+
+---
+
 ## Known issues & TODOs
 
 ### Security

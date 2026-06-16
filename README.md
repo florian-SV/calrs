@@ -194,6 +194,7 @@ Each team member's CalDAV calendars are checked for conflicts. The availability 
 
 - **Credential encryption** — CalDAV and SMTP passwords encrypted at rest with AES-256-GCM; secret key auto-generated or provided via `CALRS_SECRET_KEY`
 - **Hidden password input** — passwords never echoed to the terminal
+- **Privacy-first CAPTCHA** — optional [Cap](https://trycap.dev) integration (self-hosted, proof-of-work, no GAFAM). When configured, a `<cap-widget>` is shown on all booking pages and the token is verified server-to-server before any booking is processed. Disabled by default — no widget, no network call if unconfigured
 
 ### Localization
 
@@ -367,6 +368,64 @@ calrs serve --port 3000
 ```
 
 The login page will show a "Sign in with SSO" button. With `--auto-register true`, users are created automatically on first OIDC login. Existing local users are linked by email.
+
+## Captcha setup (Cap / trycap.dev)
+
+calrs integrates [Cap](https://trycap.dev), a self-hosted proof-of-work CAPTCHA that requires no third-party service and collects no user data. The widget appears only on booking pages — never on the dashboard or registration form.
+
+**The feature is opt-in.** If you do not configure it, the booking flow works exactly as before: no widget, no network call.
+
+### 1. Deploy a Cap instance
+
+Cap is distributed as a Docker image. Minimal compose example:
+
+```yaml
+services:
+  cap:
+    image: ghcr.io/trycap/cap:latest
+    ports:
+      - "3001:3001"
+    environment:
+      CAP_SECRET: your-secret-key
+```
+
+Create a site in the Cap dashboard and note the **site key** and **secret**.
+
+### 2. Configure calrs
+
+Go to **Admin panel → Captcha** and fill in:
+
+| Field | Example | Notes |
+|---|---|---|
+| Instance URL | `https://captcha.example.com` | Base URL of your Cap server |
+| Site key | `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx` | From the Cap dashboard |
+| Secret | `your-secret-key` | Encrypted at rest with AES-256-GCM |
+| Widget script URL | *(leave empty)* | Defaults to `https://cdn.jsdelivr.net/npm/cap-widget`. Override for air-gapped deployments. |
+
+Click **Save captcha settings**. All changes — including the widget script URL — take effect immediately, no restart required.
+
+To disable, clear the Instance URL, Site key, and Secret fields and save.
+
+### How verification works
+
+1. The guest completes the proof-of-work challenge in the browser (the Cap widget handles this automatically, with a WASM solver for speed)
+2. The widget writes the resulting token into a hidden `cap-token` form field
+3. On submit, calrs calls `POST <instance>/<site-key>/siteverify` with the token and the secret (server-to-server, never exposed to the browser)
+4. If verification fails, the guest sees the standard error page — no booking is created
+
+### Content-Security-Policy
+
+calrs sets a strict CSP on all responses. When Cap is configured, the following directives are added and updated automatically on every save:
+
+| Directive | Added value | Why |
+|---|---|---|
+| `script-src` | `'wasm-unsafe-eval' <widget-origin>` | The widget JS loads from an external origin; `wasm-unsafe-eval` allows the WASM proof-of-work solver |
+| `worker-src` | `blob:` | The widget spawns a Web Worker via a blob URL to run the solver off the main thread |
+| `connect-src` | `<instance-origin> <widget-origin>` | The browser fetches the WASM binary from the widget CDN and sends the solved token to the Cap server |
+
+When captcha is disabled, none of these directives are present — the CSP reverts to its strict baseline immediately after saving.
+
+---
 
 ## Reverse proxy
 

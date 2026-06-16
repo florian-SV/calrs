@@ -231,6 +231,7 @@ pub async fn migrate(pool: &SqlitePool) -> Result<()> {
             "053_oauth2_caldav",
             include_str!("../migrations/053_oauth2_caldav.sql"),
         ),
+        ("054_captcha", include_str!("../migrations/054_captcha.sql")),
     ];
 
     let mut applied_count = 0u32;
@@ -838,7 +839,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 53, "All 53 migrations should be tracked");
+        assert_eq!(count.0, 54, "All 54 migrations should be tracked");
     }
 
     #[tokio::test]
@@ -852,7 +853,7 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count.0, 53, "Still 53 migrations after second run");
+        assert_eq!(count.0, 54, "Still 54 migrations after second run");
     }
 
     #[tokio::test]
